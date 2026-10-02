@@ -1,5 +1,6 @@
 import { Outfit } from "next/font/google";
 import { Toaster } from "react-hot-toast";
+import { ClerkProvider } from "@clerk/nextjs";
 import StoreProvider from "@/app/StoreProvider";
 import "./globals.css";
 
@@ -12,13 +13,15 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
     return (
-        <html lang="en">
-            <body className={`${outfit.className} antialiased`}>
-                <StoreProvider>
-                    <Toaster />
-                    {children}
-                </StoreProvider>
-            </body>
-        </html>
+        <ClerkProvider>
+            <html lang="en">
+                <body className={`${outfit.className} antialiased`}>
+                    <StoreProvider>
+                        <Toaster />
+                        {children}
+                    </StoreProvider>
+                </body>
+            </html>
+        </ClerkProvider>
     );
 }

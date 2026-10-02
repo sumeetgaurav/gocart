@@ -24,7 +24,9 @@ const ProductDetails = ({ product }) => {
         dispatch(addToCart({ productId }))
     }
 
-    const averageRating = product.rating.reduce((acc, item) => acc + item.rating, 0) / product.rating.length;
+    const averageRating = product.rating.length > 0
+        ? product.rating.reduce((acc, item) => acc + item.rating, 0) / product.rating.length
+        : 0;
     
     return (
         <div className="flex max-lg:flex-col gap-12">

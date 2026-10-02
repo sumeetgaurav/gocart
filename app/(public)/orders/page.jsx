@@ -2,14 +2,16 @@
 import PageTitle from "@/components/PageTitle"
 import { useEffect, useState } from "react";
 import OrderItem from "@/components/OrderItem";
-import { orderDummyData } from "@/assets/assets";
 
 export default function Orders() {
 
     const [orders, setOrders] = useState([]);
 
     useEffect(() => {
-        setOrders(orderDummyData)
+        fetch('/api/orders')
+            .then(res => res.ok ? res.json() : [])
+            .then(setOrders)
+            .catch(() => setOrders([]));
     }, []);
 
     return (
