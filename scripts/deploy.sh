@@ -39,9 +39,7 @@ echo "==> Applying namespace"
 kubectl apply -f k8s/namespace.yaml
 
 echo "==> Applying ConfigMap"
-kubectl create configmap gocart-config -n gocart \
-    --from-literal=NEXT_PUBLIC_CURRENCY_SYMBOL="${NEXT_PUBLIC_CURRENCY_SYMBOL:-\$}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/configmap.yaml
 
 echo "==> Applying Secret"
 kubectl create secret generic gocart-secrets -n gocart \
