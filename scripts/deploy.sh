@@ -56,6 +56,14 @@ echo "==> Ensuring ingress-nginx controller is installed"
 if ! kubectl get ns ingress-nginx >/dev/null 2>&1; then
     kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
 fi
+
+# The upstream kind manifest doesn't reliably pin the controller to the
+# control-plane node, but that's the only node with the hostPort 80/443 ->
+# EC2 port mapping (see kind-cluster.yaml). Without this nodeSelector the
+# controller can land on a worker, where port 80 has nothing behind it.
+kubectl patch deployment ingress-nginx-controller -n ingress-nginx \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/os":"linux","ingress-ready":"true"}}}}}'
+
 kubectl wait --namespace ingress-nginx \
     --for=condition=ready pod \
     --selector=app.kubernetes.io/component=controller \
