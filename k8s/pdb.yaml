@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gocart-pdb
+  namespace: gocart
+spec:
+  # With minReplicas: 2 on the HPA, this guarantees voluntary disruptions
+  # (node drains, cluster upgrades) never take the app fully offline.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gocart

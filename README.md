@@ -112,12 +112,18 @@ flowchart TB
 
 Key architectural points:
 
-- **Stateless app tier** — the `gocart` Deployment runs 2 replicas of the same image; either pod can serve any request because all persistent state lives in Neon Postgres, not in the pod.
+- **Stateless app tier** — the `gocart` Deployment starts at 2 replicas of the same image; either pod can serve any request because all persistent state lives in Neon Postgres, not in the pod.
+- **Autoscaled, not fixed** — a `HorizontalPodAutoscaler` (`k8s/hpa.yaml`) keeps replicas between 2 and 5 based on CPU (70%) and memory (80%) utilization, backed by `metrics-server` (installed by `deploy.sh` since `kind` doesn't ship it out of the box).
+- **Disruption-safe** — a `PodDisruptionBudget` (`k8s/pdb.yaml`, `minAvailable: 1`) guarantees a voluntary disruption (node drain, cluster upgrade) can never take every replica down at once.
+- **Hardened pod security** — pods run as the Dockerfile's non-root `nextjs` user (`runAsNonRoot`, explicit UID/GID, `RuntimeDefault` seccomp profile) and the container drops all Linux capabilities with `allowPrivilegeEscalation: false`.
+- **Spread across failure domains** — soft `topologySpreadConstraints` (zone, then node) ask the scheduler to avoid stacking replicas together; a no-op on a single-zone `kind` cluster today, but directly load-bearing once this moves to multi-AZ EKS (see `PLAN.md`).
 - **Driver adapter, no connection pooler needed on the cluster side** — Prisma uses `@prisma/adapter-pg` over `pg`, talking directly to Neon's pooled (`DATABASE_URL`) and direct (`DIRECT_URL`) connection strings.
 - **Config vs. Secret split** — non-sensitive, public runtime config (`NEXT_PUBLIC_CURRENCY_SYMBOL`) comes from a `ConfigMap`; sensitive values (`DATABASE_URL`, `DIRECT_URL`, `CLERK_SECRET_KEY`) come from a `Secret`, both injected via `envFrom`.
 - **Health checks** — `/api/health` (a trivial `{ status: "ok" }` route) backs both the Docker Compose `healthcheck` and the Kubernetes `readinessProbe`/`livenessProbe`.
 - **Single ingress point** — `ingress-nginx` is the only component bound to host ports 80/443 (via `kind-cluster.yaml`'s `extraPortMappings` on the control-plane node), so it must be scheduled on that node — `deploy.sh` patches its `nodeSelector` to guarantee that.
 - **Build-time vs. runtime config** — `NEXT_PUBLIC_*` variables are inlined into the client JS bundle at **build** time (Docker `ARG`/`ENV`), so they're passed as `--build-arg` to `docker build`, not just injected at pod runtime.
+
+> This `kind`/EC2 setup is the local/demo deployment target. `PLAN.md` lays out the path to a production-grade **Amazon EKS + ArgoCD GitOps** deployment — autoscaled nodes, real TLS, AWS Secrets Manager, CI/CD, and observability — building on the hardening above.
 
 ---
 
@@ -311,23 +317,39 @@ Full command sequence it runs, in order:
    sed "s|image: gocart:local|image: gocart:local|" k8s/deployment.yaml | kubectl apply -f -
    kubectl apply -f k8s/service.yaml
    ```
-   (The `sed` substitutes in `$IMAGE_TAG` when you deploy a new version — see [Rolling updates](#-operating-the-cluster).) This creates the `Deployment` (2 replicas, CPU/memory requests+limits, liveness/readiness probes on `/api/health`) and the `ClusterIP` `Service` (`gocart-svc`, port `80` → container port `3000`).
+   (The `sed` substitutes in `$IMAGE_TAG` when you deploy a new version — see [Rolling updates](#-operating-the-cluster).) This creates the `Deployment` (2 replicas, CPU/memory requests+limits, hardened `securityContext`, `topologySpreadConstraints`, liveness/readiness probes on `/api/health`) and the `ClusterIP` `Service` (`gocart-svc`, port `80` → container port `3000`).
 
-9. **Install the ingress controller (if not already present)**
+9. **Install metrics-server (if not already present)**
+   ```bash
+   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+   kubectl patch deployment metrics-server -n kube-system --type=json \
+     -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+   kubectl wait --namespace kube-system --for=condition=available deployment/metrics-server --timeout=120s
+   ```
+   The HPA (next step) needs CPU/memory metrics to act on. `kind` doesn't bundle `metrics-server`, and its kubelet certs aren't signed by a CA it trusts by default — `--kubelet-insecure-tls` is the standard `kind` workaround (not needed on a real cluster like EKS).
+
+10. **Apply the HorizontalPodAutoscaler + PodDisruptionBudget**
+    ```bash
+    kubectl apply -f k8s/hpa.yaml
+    kubectl apply -f k8s/pdb.yaml
+    ```
+    Lets the Deployment scale itself (2–5 replicas, CPU/memory-driven) and protects against a voluntary disruption removing every replica at once.
+
+11. **Install the ingress controller (if not already present)**
    ```bash
    kubectl get ns ingress-nginx >/dev/null 2>&1 || \
      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
    ```
    Installs the `kind`-flavored ingress-nginx controller manifest.
 
-10. **Pin the controller to the control-plane node**
+12. **Pin the controller to the control-plane node**
     ```bash
     kubectl patch deployment ingress-nginx-controller -n ingress-nginx \
       -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/os":"linux","ingress-ready":"true"}}}}}'
     ```
     Only the control-plane node has the EC2 host-port mapping (step 2 above), so the controller **must** land there or port 80/443 would have nothing behind them.
 
-11. **Wait for the controller to be ready**
+13. **Wait for the controller to be ready**
     ```bash
     kubectl wait --namespace ingress-nginx \
       --for=condition=ready pod \
@@ -335,13 +357,13 @@ Full command sequence it runs, in order:
       --timeout=180s
     ```
 
-12. **Apply the Ingress**
+14. **Apply the Ingress**
     ```bash
     kubectl apply -f k8s/ingress.yaml
     ```
     Routes `/` on the `nginx` ingress class to `gocart-svc:80`.
 
-13. **Wait for the rollout to finish**
+15. **Wait for the rollout to finish**
     ```bash
     kubectl rollout status deployment/gocart -n gocart
     ```
@@ -366,7 +388,9 @@ All manifests live under `k8s/` and are applied into the `gocart` namespace.
 | `k8s/namespace.yaml` | `Namespace` | Isolates all GoCart resources under `gocart`. |
 | `k8s/configmap.yaml` | `ConfigMap` (`gocart-config`) | Public, non-sensitive runtime config (`NEXT_PUBLIC_CURRENCY_SYMBOL`). |
 | `k8s/secret.example.yaml` | `Secret` (template, **not applied directly**) | Documents the shape of `gocart-secrets`; the real secret is created imperatively by `deploy.sh` from `.env` so values never get committed to git. |
-| `k8s/deployment.yaml` | `Deployment` (`gocart`) | 2 replicas of the app container; wires in the ConfigMap/Secret via `envFrom`; defines `resources.requests/limits` and `readinessProbe`/`livenessProbe` against `GET /api/health`. |
+| `k8s/deployment.yaml` | `Deployment` (`gocart`) | 2 replicas of the app container; wires in the ConfigMap/Secret via `envFrom`; defines `resources.requests/limits`, a hardened `securityContext` (non-root, no capabilities), `topologySpreadConstraints`, and `readinessProbe`/`livenessProbe` against `GET /api/health`. |
+| `k8s/hpa.yaml` | `HorizontalPodAutoscaler` (`gocart-hpa`) | Scales the `gocart` Deployment between 2 and 5 replicas on 70% CPU / 80% memory utilization; requires `metrics-server` in-cluster. |
+| `k8s/pdb.yaml` | `PodDisruptionBudget` (`gocart-pdb`) | Keeps at least 1 replica available during voluntary disruptions (node drains, upgrades). |
 | `k8s/service.yaml` | `Service` (`gocart-svc`) | `ClusterIP` service, port `80` → container port `3000`, selecting pods labeled `app: gocart`. |
 | `k8s/ingress.yaml` | `Ingress` (`gocart-ingress`) | Routes all paths (`/`) on the `nginx` ingress class to `gocart-svc`; SSL redirect disabled (plain HTTP demo setup). |
 | `kind-cluster.yaml` | `kind` cluster config | 1 control-plane (+ `ingress-ready=true` label, host ports `80`/`443` mapped) + 2 workers. |
@@ -464,6 +488,10 @@ Common day-2 commands once the cluster is up:
 kubectl get pods -n gocart
 kubectl get deployment gocart -n gocart
 kubectl get svc,ingress -n gocart
+
+# Check autoscaling status (current replicas vs. target CPU/memory)
+kubectl get hpa -n gocart
+kubectl get pdb -n gocart
 
 # Tail application logs
 kubectl logs -n gocart -l app=gocart -f

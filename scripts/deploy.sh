@@ -52,6 +52,21 @@ echo "==> Applying Deployment + Service"
 sed "s|image: gocart:local|image: ${IMAGE}|" k8s/deployment.yaml | kubectl apply -f -
 kubectl apply -f k8s/service.yaml
 
+echo "==> Ensuring metrics-server is installed (required for the HPA)"
+if ! kubectl get deployment metrics-server -n kube-system >/dev/null 2>&1; then
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    # kind's kubelet serving certs aren't signed by a CA metrics-server trusts
+    # by default; this is the standard kind workaround, not something you'd
+    # do on a real cluster (e.g. EKS ships trusted kubelet certs already).
+    kubectl patch deployment metrics-server -n kube-system --type=json \
+        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+fi
+kubectl wait --namespace kube-system --for=condition=available deployment/metrics-server --timeout=120s
+
+echo "==> Applying HorizontalPodAutoscaler + PodDisruptionBudget"
+kubectl apply -f k8s/hpa.yaml
+kubectl apply -f k8s/pdb.yaml
+
 echo "==> Ensuring ingress-nginx controller is installed"
 if ! kubectl get ns ingress-nginx >/dev/null 2>&1; then
     kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
