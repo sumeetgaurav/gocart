@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Keeps npm dependencies (package.json / package-lock.json) current.
+  # Opens a PR per outdated package group, which then runs through ci.yml
+  # like any other PR.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # Batches minor/patch bumps into one PR instead of one-per-package,
+      # so you're not reviewing 15 tiny version-bump PRs a week.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Keeps the base image in Dockerfile (node:20-alpine) current.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Keeps the GitHub Actions themselves (actions/checkout, docker/* actions,
+  # etc.) pinned to current, non-vulnerable versions.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

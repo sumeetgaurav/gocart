@@ -25,6 +25,7 @@
 - [💾 Why No PersistentVolume / PersistentVolumeClaim?](#-why-no-persistentvolume--persistentvolumeclaim)
 - [🔐 Environment Variables](#-environment-variables)
 - [🧰 Operating the Cluster](#-operating-the-cluster)
+- [⚙️ CI/CD with GitHub Actions](#-cicd-with-github-actions)
 - [🤝 Contributing](#-contributing)
 - [📜 License](#-license)
 
@@ -510,6 +511,98 @@ kind delete cluster --name gocart
 ```
 
 Setting `IMAGE_TAG` (e.g. `IMAGE_TAG=v2 ./scripts/deploy.sh`) builds `gocart:v2`, loads it into `kind`, and substitutes it into the Deployment, triggering a visible rolling update across the 2 replicas.
+
+---
+
+## ⚙️ CI/CD with GitHub Actions <a name="-cicd-with-github-actions"></a>
+
+Every push and pull request runs through automated checks defined in [`.github/workflows/`](./.github/workflows/), and every merge to `main` can automatically publish a new Docker image. This section explains **what runs, when, why, and what you need to configure** — written so it's understandable even if you've never used GitHub Actions before.
+
+### What is a GitHub Actions "workflow"?
+
+A workflow is a YAML file in `.github/workflows/` that tells GitHub "when X happens, run these steps on a fresh virtual machine." This repo has two workflows:
+
+| File | Triggers on | Purpose |
+|---|---|---|
+| [`ci.yml`](./.github/workflows/ci.yml) | Every push to `main` **and** every pull request into `main` | Verifies the code is healthy — lint, build, Docker build test |
+| [`docker-publish.yml`](./.github/workflows/docker-publish.yml) | A push/merge **directly to `main`** (never on a PR) | Builds the production Docker image and publishes it to Docker Hub |
+
+The split matters: `ci.yml` is a **gate** (it just checks things, nothing leaves the runner), while `docker-publish.yml` is a **release step** (it pushes an artifact to the outside world). Keeping them separate means a PR from anyone can be safely checked without ever needing Docker Hub credentials — only merges to `main` get that privilege.
+
+### `ci.yml` — the pull request checks
+
+This workflow runs three independent jobs in parallel. Think of each job as its own disposable Ubuntu VM:
+
+1. **Lint** — runs `npm run lint` (ESLint). Catches style issues, unused variables, and common correctness mistakes before a human reviewer has to.
+2. **Build** — runs `npx prisma generate` followed by `npm run build`. This is the same production build Next.js uses, so if the app fails to compile, type-checks badly, or has a broken import, this job turns red. Running `prisma generate` first also validates that `prisma/schema.prisma` is syntactically correct — a broken schema fails here instead of at deploy time.
+3. **Docker Build Test** — runs `docker build` against the repo's `Dockerfile` using the exact same multi-stage process described in [🐳 Running with Docker Compose](#-running-with-docker-compose), but with `push: false`. It proves the image *can* be built without actually publishing anything. This catches a broken `Dockerfile` (bad `COPY` path, missing build arg, etc.) at PR time instead of discovering it only when someone merges to `main`.
+
+A few implementation details worth knowing:
+
+- **Dependency caching**: `actions/setup-node` is configured with `cache: "npm"`, so the `~/.npm` cache is restored/saved automatically between runs, keyed off `package-lock.json`. This makes `npm ci` noticeably faster on repeat runs instead of re-downloading every package each time.
+- **Placeholder env vars**: `NEXT_PUBLIC_CURRENCY_SYMBOL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, and `DIRECT_URL` are given safe dummy values (see the `env:` block at the top of `ci.yml`) so the build can run **without any real secrets configured**. `NEXT_PUBLIC_*` variables get baked into the client-side JavaScript bundle at build time (see [🔐 Environment Variables](#-environment-variables)), so Next.js needs *some* value to inline even when it's just running a CI check, not talking to a real Clerk account. If you later add the real values as repository secrets (same names), the workflow automatically prefers them over the dummy fallback — see `${{ secrets.X || 'fallback' }}` in the YAML.
+- **Required status check**: to actually block a bad PR from merging, go to your repo's **Settings → Branches → Branch protection rules** and add a rule for `main` that requires the `Lint`, `Build`, and `Docker Build Test` checks to pass. Without this, the workflow runs and reports red/green, but GitHub won't stop you from merging anyway.
+
+### `docker-publish.yml` — build & push to Docker Hub
+
+Once code is merged into `main`, this workflow:
+
+1. Logs into Docker Hub using repository secrets (never hardcoded credentials).
+2. Builds the production image from the same `Dockerfile`.
+3. Pushes it to Docker Hub under **[`sumeetgaurav/gocart`](https://hub.docker.com/r/sumeetgaurav/gocart)** with two tags:
+   - `latest` — always the most recent successful build from `main`.
+   - `sha-<short-commit-sha>` — an immutable tag pinned to the exact commit it was built from (e.g. `sha-a1b2c3d`), so you can always pull/redeploy *exactly* that build later, even after `latest` has moved on.
+
+This is what makes the Kubernetes side of this repo (see [☸️ Deploying to a `kind` Cluster](#-deploying-to-a-kind-cluster-on-aws-ec2)) continuously deployable: `scripts/deploy.sh` (or a future workflow step) can pull `sumeetgaurav/gocart:sha-<commit>` and roll it out with `kubectl`.
+
+#### Required setup: Docker Hub secrets
+
+This workflow needs two **repository secrets** to authenticate with Docker Hub. Without them, every run of `docker-publish.yml` will fail at the "Log in to Docker Hub" step. To add them:
+
+1. Go to **Docker Hub → your avatar → Account Settings → Security → New Access Token**, and generate a token (give it a descriptive name like `gocart-github-actions`; don't use your Docker Hub password).
+2. In the GitHub repo, go to **Settings → Secrets and variables → Actions → New repository secret**, and add:
+
+| Secret name | Value |
+|---|---|
+| `DOCKERHUB_USERNAME` | Your Docker Hub username (e.g. `sumeetgaurav`) |
+| `DOCKERHUB_TOKEN` | The access token you generated above (**not** your account password) |
+
+Optionally, also add `NEXT_PUBLIC_CURRENCY_SYMBOL` and `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` as repo secrets if you want the **published** image's client bundle to be built with real values instead of the CI placeholders — see [🔐 Environment Variables](#-environment-variables) for what these do.
+
+### Dependabot — automated dependency updates
+
+[`.github/dependabot.yml`](./.github/dependabot.yml) configures GitHub to open pull requests automatically when a dependency has a newer version available, across three ecosystems:
+
+| Ecosystem | What it watches | 
+|---|---|
+| `npm` | `package.json` / `package-lock.json` — your app's JS dependencies (Next.js, React, Prisma, Clerk, etc.) |
+| `docker` | The base image in `Dockerfile` (`node:20-alpine`) |
+| `github-actions` | The actions used inside `.github/workflows/*.yml` (e.g. `actions/checkout`, `docker/build-push-action`) |
+
+Each ecosystem is checked **weekly**. Minor and patch npm updates are batched into a single grouped PR (so you review one PR for "15 small bumps" instead of 15 separate PRs); every Dependabot PR automatically runs through `ci.yml` just like a human-authored PR, so you only need to glance at the diff and the green checkmark before merging.
+
+### How it all fits together
+
+```
+Developer opens a PR
+        │
+        ▼
+  ci.yml runs:  Lint ─┐
+                Build ─┼─► all green? ──► PR can be merged (if branch protection requires it)
+     Docker Build Test ┘
+
+PR merged into main
+        │
+        ▼
+docker-publish.yml runs:
+  Login to Docker Hub → Build image → Push "latest" + "sha-<commit>"
+        │
+        ▼
+  Image available at hub.docker.com/r/sumeetgaurav/gocart
+        │
+        ▼
+  Pull it from a kind/EC2/any Kubernetes cluster to deploy (see ☸️ section above)
+```
 
 ---
 

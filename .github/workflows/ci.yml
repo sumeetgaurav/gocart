@@ -1,0 +1,95 @@
+name: CI
+
+# Runs on every push to main and on every pull request targeting main.
+# This is the "PR checks" workflow: it gives every change a lint pass, a real
+# Next.js production build, and a Docker image build-test before it's allowed
+# to merge. Add this workflow as a required status check in the branch
+# protection rules for `main` so PRs can't merge while it's red.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Dummy, non-secret placeholders used only so `prisma generate` and
+# `next build` can run without real credentials. NEXT_PUBLIC_* values get
+# inlined into the client bundle at build time, so the build step needs
+# *some* value even when it never talks to a real Clerk/Postgres instance.
+# Real values (set as repo secrets) are used automatically when present.
+env:
+  NEXT_PUBLIC_CURRENCY_SYMBOL: ${{ secrets.NEXT_PUBLIC_CURRENCY_SYMBOL || '$' }}
+  NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_dGVzdC5jbGVyay5hY2NvdW50cy5kZXYk' }}
+  DIRECT_URL: ${{ secrets.DIRECT_URL || 'postgresql://user:pass@localhost:5432/db' }}
+
+jobs:
+  # 1) Lint — catches style/correctness issues flagged by `next lint`.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm" # 3) caches ~/.npm between runs, keyed on package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  # 2) + 4) Build check — generates the Prisma client against schema.prisma
+  # (this is what "Prisma validation" catches: a schema that doesn't
+  # generate is a schema with an error) and then runs a full production
+  # Next.js build, the same way the Dockerfile does.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build Next.js app
+        run: npm run build
+
+  # 8) Docker build test — proves the multi-stage Dockerfile still builds an
+  # image on every PR, *without* pushing it anywhere. This catches a broken
+  # Dockerfile at PR time instead of at deploy time. The actual
+  # build-and-push-to-Docker-Hub workflow is docker-publish.yml, and only
+  # runs after code lands on main.
+  docker-build-test:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            NEXT_PUBLIC_CURRENCY_SYMBOL=${{ env.NEXT_PUBLIC_CURRENCY_SYMBOL }}
+            NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
