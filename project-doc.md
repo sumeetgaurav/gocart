@@ -149,15 +149,51 @@ chmod +x scripts/ec2-bootstrap.sh
 newgrp docker   # pick up docker group membership without re-logging in
 ```
 
-What it installs:
+What it installs, step by step, with the exact commands it runs:
 
-| Step | What | Why |
-|---|---|---|
-| 1 | Docker Engine (`apt-get`/`dnf`) | `kind` runs each Kubernetes "node" as a Docker container |
-| 2 | `systemctl enable --now docker` | Starts Docker, enables on boot |
-| 3 | `usermod -aG docker $USER` | Run `docker`/`kind` without `sudo` |
-| 4 | `kubectl` (pinned `v1.31.0`) | CLI to talk to the cluster |
-| 5 | `kind` (pinned `v0.27.0`) | Creates the Kubernetes cluster itself |
+**1. Docker Engine** — *why:* `kind` runs each Kubernetes "node" as a Docker container, so nothing else in this list works without it.
+
+On Ubuntu/Debian:
+```bash
+sudo apt-get update -y
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+On Amazon Linux 2023:
+```bash
+sudo dnf install -y docker
+```
+
+**2. Start Docker and enable it on boot** — *why:* so the Docker daemon survives an instance reboot without manual intervention.
+```bash
+sudo systemctl enable --now docker
+```
+
+**3. Add your user to the `docker` group** — *why:* lets your non-root SSH user run `docker`/`kind` without typing `sudo` every time.
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+**4. Install `kubectl`, pinned to `v1.31.0`** — *why:* the CLI used to talk to the cluster (`kubectl apply`, `kubectl get pods`, etc.). Pinning the version avoids a surprise behavior change from an untested newer release.
+```bash
+curl -fsSLO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/kubectl
+```
+
+**5. Install `kind`, pinned to `v0.27.0`** — *why:* `kind` is what actually creates the Kubernetes cluster (as Docker containers) in the next step.
+```bash
+curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64"
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+```
 
 ### 4.5 Step 4 — Deploy (`scripts/deploy.sh`)
 
