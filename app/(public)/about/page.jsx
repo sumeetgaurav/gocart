@@ -14,7 +14,7 @@ export default function AboutPage() {
                 <p className='mt-4 text-slate-600'>
                     Whether you&apos;re browsing as a shopper or growing your own store with
                     GoCart Plus, our goal is the same: make online shopping fast, secure, and
-                    genuinely enjoyable.
+                    genuinely enjoyable. - Kind
                 </p>
             </div>
 
