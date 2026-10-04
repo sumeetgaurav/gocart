@@ -524,24 +524,25 @@ A workflow is a YAML file in `.github/workflows/` that tells GitHub "when X happ
 
 | File | Triggers on | Purpose |
 |---|---|---|
-| [`ci.yml`](./.github/workflows/ci.yml) | Every push to `main` **and** every pull request into `main` | Verifies the code is healthy — lint, build, Docker build test |
+| [`ci.yml`](./.github/workflows/ci.yml) | Every push to `main` **and** every pull request into `main` | Verifies the code is healthy — lint, build, Docker build test, `kind` manifest smoke test |
 | [`docker-publish.yml`](./.github/workflows/docker-publish.yml) | A push/merge **directly to `main`** (never on a PR) | Builds the production Docker image and publishes it to Docker Hub |
 
 The split matters: `ci.yml` is a **gate** (it just checks things, nothing leaves the runner), while `docker-publish.yml` is a **release step** (it pushes an artifact to the outside world). Keeping them separate means a PR from anyone can be safely checked without ever needing Docker Hub credentials — only merges to `main` get that privilege.
 
 ### `ci.yml` — the pull request checks
 
-This workflow runs three independent jobs in parallel. Think of each job as its own disposable Ubuntu VM:
+This workflow runs four independent jobs in parallel. Think of each job as its own disposable Ubuntu VM:
 
 1. **Lint** — runs `npm run lint` (ESLint). Catches style issues, unused variables, and common correctness mistakes before a human reviewer has to.
 2. **Build** — runs `npx prisma generate` followed by `npm run build`. This is the same production build Next.js uses, so if the app fails to compile, type-checks badly, or has a broken import, this job turns red. Running `prisma generate` first also validates that `prisma/schema.prisma` is syntactically correct — a broken schema fails here instead of at deploy time.
 3. **Docker Build Test** — runs `docker build` against the repo's `Dockerfile` using the exact same multi-stage process described in [🐳 Running with Docker Compose](#-running-with-docker-compose), but with `push: false`. It proves the image *can* be built without actually publishing anything. This catches a broken `Dockerfile` (bad `COPY` path, missing build arg, etc.) at PR time instead of discovering it only when someone merges to `main`.
+4. **Kind Smoke Test** — builds the image, spins up a throwaway `kind` (Kubernetes-in-Docker) cluster directly on the CI runner using [`helm/kind-action`](https://github.com/helm/kind-action), loads the image into it, and applies `k8s/namespace.yaml`, `configmap.yaml`, a dummy `Secret`, `deployment.yaml`, and `service.yaml`. It then waits for the rollout to finish and curls `/api/health` through a `kubectl port-forward`. This is a separate, ephemeral cluster from the long-lived one on the EC2 box (see [☸️ Deploying to a `kind` Cluster](#-deploying-to-a-kind-cluster-on-aws-ec2)) — its only job is to catch a broken manifest (wrong selector, wrong port, bad probe path) on every PR, before it ever reaches the EC2 instance. It deliberately skips `hpa.yaml`/`ingress.yaml`, since those need `metrics-server`/`ingress-nginx` installed first and would slow down every PR for a stretch-goal check; `/api/health` itself doesn't touch the database, so no real secrets are needed for the pod to report Ready.
 
 A few implementation details worth knowing:
 
 - **Dependency caching**: `actions/setup-node` is configured with `cache: "npm"`, so the `~/.npm` cache is restored/saved automatically between runs, keyed off `package-lock.json`. This makes `npm ci` noticeably faster on repeat runs instead of re-downloading every package each time.
 - **Placeholder env vars**: `NEXT_PUBLIC_CURRENCY_SYMBOL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, and `DIRECT_URL` are given safe dummy values (see the `env:` block at the top of `ci.yml`) so the build can run **without any real secrets configured**. `NEXT_PUBLIC_*` variables get baked into the client-side JavaScript bundle at build time (see [🔐 Environment Variables](#-environment-variables)), so Next.js needs *some* value to inline even when it's just running a CI check, not talking to a real Clerk account. If you later add the real values as repository secrets (same names), the workflow automatically prefers them over the dummy fallback — see `${{ secrets.X || 'fallback' }}` in the YAML.
-- **Required status check**: to actually block a bad PR from merging, go to your repo's **Settings → Branches → Branch protection rules** and add a rule for `main` that requires the `Lint`, `Build`, and `Docker Build Test` checks to pass. Without this, the workflow runs and reports red/green, but GitHub won't stop you from merging anyway.
+- **Required status check**: to actually block a bad PR from merging, go to your repo's **Settings → Branches → Branch protection rules** and add a rule for `main` that requires the `Lint`, `Build`, `Docker Build Test`, and `Kind Smoke Test` checks to pass. Without this, the workflow runs and reports red/green, but GitHub won't stop you from merging anyway.
 
 ### `docker-publish.yml` — build & push to Docker Hub
 
@@ -588,8 +589,9 @@ Developer opens a PR
         │
         ▼
   ci.yml runs:  Lint ─┐
-                Build ─┼─► all green? ──► PR can be merged (if branch protection requires it)
-     Docker Build Test ┘
+                Build ─┤
+     Docker Build Test ─┼─► all green? ──► PR can be merged (if branch protection requires it)
+      Kind Smoke Test ─┘
 
 PR merged into main
         │

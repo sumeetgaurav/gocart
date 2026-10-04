@@ -93,3 +93,69 @@ jobs:
             NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Kind smoke test — spins up a throwaway `kind` cluster on the CI runner
+  # itself (separate from the long-lived one on the EC2 box) and proves the
+  # manifests in k8s/ actually produce a healthy, Ready pod: catches a broken
+  # selector/port/probe path/env var at PR time instead of on the EC2 box.
+  # The real app secrets are never needed here since /api/health (what both
+  # probes and this job check) doesn't touch the database.
+  kind-smoke-test:
+    name: Kind Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Builds straight into the local Docker daemon (load: true) under the
+      # same tag k8s/deployment.yaml already expects (`gocart:local`,
+      # imagePullPolicy: IfNotPresent), so no manifest edits are needed.
+      - name: Build image for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: gocart:local
+          build-args: |
+            NEXT_PUBLIC_CURRENCY_SYMBOL=${{ env.NEXT_PUBLIC_CURRENCY_SYMBOL }}
+            NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: gocart
+
+      - name: Load image into kind
+        run: kind load docker-image gocart:local --name gocart
+
+      # Deliberately skips hpa.yaml/ingress.yaml here: those need
+      # metrics-server/ingress-nginx installed first (see scripts/deploy.sh),
+      # which would make every PR slower for a stretch-goal smoke test. This
+      # job is about the core workload (Deployment/Service/ConfigMap/Secret)
+      # coming up healthy, not reproducing the full EC2 bootstrap.
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl create secret generic gocart-secrets -n gocart \
+            --from-literal=DATABASE_URL="postgresql://user:pass@localhost:5432/db" \
+            --from-literal=DIRECT_URL="postgresql://user:pass@localhost:5432/db" \
+            --from-literal=CLERK_SECRET_KEY="sk_test_placeholder" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/gocart -n gocart --timeout=120s
+
+      - name: Smoke-test the health endpoint
+        run: |
+          kubectl port-forward -n gocart svc/gocart-svc 8080:80 &
+          sleep 3
+          curl -sf http://localhost:8080/api/health
